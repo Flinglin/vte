@@ -28,7 +28,6 @@
 //! [Paul Williams' ANSI parser state machine]: https://vt100.net/emu/dec_ansi_parser
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 #![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use core::mem::MaybeUninit;
 use core::str;
@@ -39,13 +38,14 @@ use arrayvec::ArrayVec;
 mod params;
 
 #[cfg(feature = "ansi")]
-#[cfg_attr(docsrs, doc(cfg(feature = "ansi")))]
 pub mod ansi;
 pub use params::{Params, ParamsIter};
 
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC_PARAMS: usize = 16;
 const MAX_OSC_RAW: usize = 1024;
+const MIN_BATCH_TEXT_BYTES: usize = 4;
+const MIN_BATCH_LINES_BYTES: usize = 128;
 
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`]
 ///
@@ -138,7 +138,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     ///
     /// Returns the number of bytes read before termination.
     ///
-    /// See [`Self::advance`] for more details.
+    /// See [`Perform::advance`] for more details.
     #[inline]
     #[must_use = "Returned value should be used to processs the remaining bytes"]
     pub fn advance_until_terminated<P: Perform>(
@@ -156,6 +156,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() && !performer.terminated() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+                State::CsiParam => i += self.advance_csi_params::<P, true>(performer, &bytes[i..]),
+                State::OscString => i += self.advance_osc_bytes::<P, true>(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
@@ -256,9 +258,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                     if self.params.is_full() {
                         self.ignoring = true;
                     } else {
-                        param = param.saturating_mul(10).saturating_add((byte - b'0') as u16);
+                        param = param
+                            .saturating_mul(10)
+                            .saturating_add((byte - b'0') as u16);
                     }
-                },
+                }
                 b';' | b':' => {
                     if self.params.is_full() {
                         self.ignoring = true;
@@ -270,14 +274,14 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                         }
                         param = 0;
                     }
-                },
+                }
                 _ => {
                     // Dispatch at most one callback before returning so synchronized-output
                     // termination and in-band controls keep their original byte boundary.
                     self.param = param;
                     self.advance_csi_param(performer, byte);
                     return index + 1;
-                },
+                }
             }
         }
         self.param = param;
@@ -452,7 +456,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         }
     }
 
-        fn advance_osc_bytes<P: Perform, const CHECK_TERMINATED: bool>(
+    fn advance_osc_bytes<P: Perform, const CHECK_TERMINATED: bool>(
         &mut self,
         performer: &mut P,
         bytes: &[u8],
@@ -689,9 +693,32 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             return 1;
         }
 
+        // Short control-heavy streams can dispatch one ASCII byte without UTF-8 validation.
+        if plain_chars == 1 && bytes[0].is_ascii() {
+            let byte = bytes[0];
+            if byte <= 0x1f {
+                performer.execute(byte);
+            } else {
+                performer.print(byte as char);
+            }
+
+            let mut processed = 1;
+            if processed < num_bytes {
+                self.state = State::Escape;
+                self.reset_params();
+                processed += 1;
+            }
+            return processed;
+        }
+
         match str::from_utf8(&bytes[..plain_chars]) {
             Ok(parsed) => {
-                Self::ground_dispatch(performer, parsed);
+                let batched_lines = plain_chars == num_bytes
+                    && parsed.len() >= MIN_BATCH_LINES_BYTES
+                    && Self::dispatch_ascii_lines(performer, parsed);
+                if !batched_lines {
+                    Self::ground_dispatch(performer, parsed);
+                }
                 let mut processed = plain_chars;
 
                 // If there's another character, it must be escape so process it directly.
@@ -803,12 +830,104 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// Handle ground dispatch of print/execute for all characters in a string.
     #[inline]
     fn ground_dispatch<P: Perform>(performer: &mut P, text: &str) {
-        for c in text.chars() {
-            match c {
-                '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(c as u8),
-                _ => performer.print(c),
+        if text.len() < MIN_BATCH_TEXT_BYTES {
+            for character in text.chars() {
+                match character {
+                    '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(character as u8),
+                    _ => performer.print(character),
+                }
+            }
+            return;
+        }
+
+        let mut printable_start = 0;
+
+        // ASCII terminal output can forward long printable spans without decoding each byte.
+        if text.is_ascii() {
+            for (index, byte) in text.bytes().enumerate() {
+                if byte <= 0x1f || byte == 0x7f {
+                    if printable_start < index {
+                        Self::dispatch_printable_text(performer, &text[printable_start..index]);
+                    }
+                    if byte <= 0x1f {
+                        performer.execute(byte);
+                    } else {
+                        performer.print(byte as char);
+                    }
+                    printable_start = index + 1;
+                }
+            }
+        } else {
+            let mut ascii_start = None;
+            for (index, character) in text.char_indices() {
+                if character == ' ' || character.is_ascii_graphic() {
+                    ascii_start.get_or_insert(index);
+                    continue;
+                }
+
+                if let Some(start) = ascii_start.take() {
+                    Self::dispatch_printable_text(performer, &text[start..index]);
+                }
+                match character {
+                    '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(character as u8),
+                    _ => performer.print(character),
+                }
+            }
+
+            if let Some(start) = ascii_start {
+                Self::dispatch_printable_text(performer, &text[start..]);
+            }
+            return;
+        }
+
+        if printable_start < text.len() {
+            Self::dispatch_printable_text(performer, &text[printable_start..]);
+        }
+    }
+
+    #[inline]
+    fn dispatch_printable_text<P: Perform>(performer: &mut P, text: &str) {
+        // Tiny spans are cheaper through the existing scalar callback.
+        if text.len() < MIN_BATCH_TEXT_BYTES {
+            for character in text.chars() {
+                performer.print(character);
+            }
+        } else {
+            performer.print_text(text);
+        }
+    }
+
+    #[inline]
+    fn dispatch_ascii_lines<P: Perform>(performer: &mut P, text: &str) -> bool {
+        if !text.ends_with("\r\n") {
+            return false;
+        }
+
+        let bytes = text.as_bytes();
+        let mut line_breaks = 0;
+        let mut line_start = 0;
+        let mut max_line_length = 0;
+        let mut index = 0;
+
+        while index < bytes.len() {
+            match bytes[index] {
+                b' '..=b'~' => index += 1,
+                b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                    line_breaks += 1;
+                    max_line_length = max_line_length.max(index - line_start);
+                    index += 2;
+                    line_start = index;
+                },
+                _ => return false,
             }
         }
+
+        if line_breaks < 2 {
+            return false;
+        }
+
+        performer.print_text_lines(text, line_breaks, max_line_length);
+        true
     }
 }
 
@@ -844,6 +963,28 @@ enum State {
 pub trait Perform {
     /// Draw a character to the screen and update states.
     fn print(&mut self, _c: char) {}
+
+    /// Draw a printable text span while preserving scalar behavior by default.
+    fn print_text(&mut self, text: &str) {
+        for character in text.chars() {
+            self.print(character);
+        }
+    }
+
+    /// Draw complete printable ASCII lines terminated by carriage return and line feed.
+    ///
+    /// `line_count` and `max_line_length` describe the parser-validated `text`.
+    fn print_text_lines(&mut self, text: &str, _line_count: usize, _max_line_length: usize) {
+        for line in text.split_inclusive("\r\n") {
+            if let Some(printable) = line.strip_suffix("\r\n") {
+                self.print_text(printable);
+                self.execute(b'\r');
+                self.execute(b'\n');
+            } else {
+                self.print_text(line);
+            }
+        }
+    }
 
     /// Execute a C0 or C1 control function.
     fn execute(&mut self, _byte: u8) {}
@@ -982,7 +1123,88 @@ mod tests {
         }
     }
 
-    
+    #[derive(Debug, PartialEq, Eq)]
+    enum TextDispatch {
+        Print(String),
+        PrintLines(String),
+        PrintCharacter(char),
+        Execute(u8),
+    }
+
+    #[derive(Default)]
+    struct TextDispatcher {
+        dispatched: Vec<TextDispatch>,
+    }
+
+    impl Perform for TextDispatcher {
+        fn print(&mut self, character: char) {
+            self.dispatched.push(TextDispatch::PrintCharacter(character));
+        }
+
+        fn print_text(&mut self, text: &str) {
+            self.dispatched.push(TextDispatch::Print(text.to_owned()));
+        }
+
+        fn print_text_lines(&mut self, text: &str, _line_count: usize, _max_line_length: usize) {
+            self.dispatched.push(TextDispatch::PrintLines(text.to_owned()));
+        }
+
+        fn execute(&mut self, byte: u8) {
+            self.dispatched.push(TextDispatch::Execute(byte));
+        }
+    }
+
+    #[test]
+    fn ground_dispatch_batches_printable_text_around_controls() {
+        let mut dispatcher = TextDispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, "alpha\r\nbeta中文\u{85}gamma".as_bytes());
+
+        assert_eq!(
+            dispatcher.dispatched,
+            vec![
+                TextDispatch::Print("alpha".to_owned()),
+                TextDispatch::Execute(b'\r'),
+                TextDispatch::Execute(b'\n'),
+                TextDispatch::Print("beta".to_owned()),
+                TextDispatch::PrintCharacter('中'),
+                TextDispatch::PrintCharacter('文'),
+                TextDispatch::Execute(0x85),
+                TextDispatch::Print("gamma".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ground_dispatch_batches_complete_ascii_lines() {
+        let mut dispatcher = TextDispatcher::default();
+        let mut parser = Parser::new();
+        let text = format!("{}\r\n{}\r\n", "a".repeat(64), "b".repeat(64));
+
+        parser.advance(&mut dispatcher, text.as_bytes());
+
+        assert_eq!(dispatcher.dispatched, vec![TextDispatch::PrintLines(text)]);
+    }
+
+    #[test]
+    fn ascii_line_batch_default_preserves_scalar_dispatch() {
+        let mut dispatcher = Dispatcher::default();
+        dispatcher.print_text_lines("a\r\nb\r\n", 2, 1);
+
+        assert_eq!(
+            dispatcher.dispatched,
+            vec![
+                Sequence::Print('a'),
+                Sequence::Execute(b'\r'),
+                Sequence::Execute(b'\n'),
+                Sequence::Print('b'),
+                Sequence::Execute(b'\r'),
+                Sequence::Execute(b'\n'),
+            ]
+        );
+    }
+
     #[test]
     fn csi_batches_preserve_controls_subparameters_and_chunk_boundaries() {
         let bytes = b"\x1b[?38:2::255:128:0;999999m\x1b[1\x07;2 q\x1b[12\x18Z";
@@ -1110,7 +1332,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn parse_osc() {

@@ -505,6 +505,28 @@ pub trait Handler {
     /// A character to be displayed.
     fn input(&mut self, _c: char) {}
 
+    /// Printable text to display, with scalar behavior retained for existing handlers.
+    fn input_text(&mut self, text: &str) {
+        for character in text.chars() {
+            self.input(character);
+        }
+    }
+
+    /// Complete printable ASCII lines terminated by carriage return and line feed.
+    ///
+    /// `line_count` and `max_line_length` describe the parser-validated `text`.
+    fn input_text_lines(&mut self, text: &str, _line_count: usize, _max_line_length: usize) {
+        for line in text.split_inclusive("\r\n") {
+            if let Some(printable) = line.strip_suffix("\r\n") {
+                self.input_text(printable);
+                self.carriage_return();
+                self.linefeed();
+            } else {
+                self.input_text(line);
+            }
+        }
+    }
+
     /// Set cursor to position.
     fn goto(&mut self, _line: i32, _col: usize) {}
 
@@ -1302,6 +1324,22 @@ where
     }
 
     #[inline]
+    fn print_text(&mut self, text: &str) {
+        self.handler.input_text(text);
+        if let Some(character) = text.chars().next_back() {
+            self.state.preceding_char = Some(character);
+        }
+    }
+
+    #[inline]
+    fn print_text_lines(&mut self, text: &str, line_count: usize, max_line_length: usize) {
+        self.handler.input_text_lines(text, line_count, max_line_length);
+        if let Some(byte) = text.bytes().rev().find(|byte| (b' '..=b'~').contains(byte)) {
+            self.state.preceding_char = Some(byte as char);
+        }
+    }
+
+    #[inline]
     fn execute(&mut self, byte: u8) {
         match byte {
             C0::HT => self.handler.put_tab(1),
@@ -1347,7 +1385,7 @@ where
                 }
                 buf.push_str("],");
             }
-            debug!("[unhandled osc_dispatch]: [{}] at line {}", &buf, line!());
+            debug!("[unhandled osc_dispatch]: [{}] at line {}", buf, line!());
         }
 
         if params.is_empty() || params[0].is_empty() {
@@ -2100,6 +2138,51 @@ mod tests {
                 reset_colors: Vec::new(),
             }
         }
+    }
+
+    #[derive(Default)]
+    struct BatchInputHandler {
+        batches: Vec<String>,
+        line_batches: Vec<String>,
+        scalar: String,
+    }
+
+    impl Handler for BatchInputHandler {
+        fn input(&mut self, character: char) {
+            self.scalar.push(character);
+        }
+
+        fn input_text(&mut self, text: &str) {
+            self.batches.push(text.to_owned());
+        }
+
+        fn input_text_lines(&mut self, text: &str, _line_count: usize, _max_line_length: usize) {
+            self.line_batches.push(text.to_owned());
+        }
+    }
+
+    #[test]
+    fn batch_input_updates_preceding_character_for_rep() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = BatchInputHandler::default();
+
+        parser.advance(&mut handler, b"abcd\x1b[3b");
+
+        assert_eq!(handler.batches, ["abcd"]);
+        assert_eq!(handler.scalar, "ddd");
+    }
+
+    #[test]
+    fn batch_line_input_updates_preceding_character_for_rep() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = BatchInputHandler::default();
+        let lines = format!("{}\r\n{}\r\n", "a".repeat(64), "b".repeat(64));
+
+        parser.advance(&mut handler, lines.as_bytes());
+        parser.advance(&mut handler, b"\x1b[2b");
+
+        assert_eq!(handler.line_batches, [lines]);
+        assert_eq!(handler.scalar, "bb");
     }
 
     #[test]
